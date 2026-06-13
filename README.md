@@ -2,11 +2,12 @@
 
 A hand-written **agent loop** using a local LLM (`llama3.2` via Ollama), built
 to understand what an agent actually *is* underneath frameworks like LangGraph
-or tools like Cursor — and, just as importantly, **where agents fail and why**.
+or tools like Cursor — and, just as importantly, **where agents fail, why, and
+what it actually takes to make a small model reliable.**
 
 No framework. The loop is written by hand so every step is visible. The local
 model is small *on purpose*: its failures are loud and frequent, which makes the
-real failure modes of agents easy to see and reason about.
+real behavior of agents easy to see and reason about.
 
 ## What an agent is (the one-line version)
 
@@ -35,9 +36,10 @@ everything from prior passes.
 ## Tools in this build
 
 Simple local Python functions: `get_current_time`, `get_current_date`,
-`get_current_day`, a composite `get_current_time_date_and_day`, and `add`.
-A tool is just a function plus a JSON schema (name, description, parameters)
-that the model reads to decide what to call.
+`get_current_day`, a composite `get_current_time_date_and_day`, `add`, and
+`get_hour_from_time` (which takes a time string and returns the hour). A tool is
+just a function plus a JSON schema (name, description, parameters) the model
+reads to decide what to call.
 
 ## The reliability findings (the real point of this project)
 
@@ -49,43 +51,64 @@ can give different output). Mapping where it's reliable and where it isn't:
 |-----------|-------------|
 | Single tool call ("what time is it?") | Works reliably |
 | Independent multi-tool ("date+time AND add 10+20") | Mostly works; sometimes drops part of the answer in synthesis |
-| **Dependent chaining** ("15 plus the current hour") | **Fails** — see below |
+| **Dependent chaining** ("15 plus the current hour") | Failed for a long time — then *solved*. See the journey below. |
 
-### Why dependent chaining breaks
+### The dependent-chaining journey (the main lesson)
 
-Dependent chaining = one tool's *output* must become the next tool's *input*.
-The model would fetch the time (`11:05:25`) fine, but then could not reliably
-**extract `11` and pass it to `add`** — it kept passing the literal string
-`'get_current_time'` (or even shell syntax `$(get_current_time)`) as the
-argument. It understands *what* it needs but not the mechanics of "call A, read
-A's result, then call B with that value." This is a planning-depth limit of the
-small model.
+Dependent chaining = one tool's *output* must become the next tool's *input*
+("get the time → extract the hour → add 15"). This was the hard case, and the
+path to making it work is the most valuable thing in this repo:
 
-### The scariest failure mode: confident, clean-looking wrong answers
+1. **Plain question ("What is 15 plus the current hour?")** — failed almost
+   every run. The model would pass the literal string `'get_current_time'` (the
+   tool *name*) as the argument instead of the value, or fabricate an hour. It
+   understood the task but couldn't express it as a sequence of separate calls.
 
-Several runs fetched the correct data and then **fabricated a different value in
-the final answer** — e.g. fetched `2026-06-13`, then reported `2023-12-01`; or
-fetched the real time but reported a made-up hour. These answers *look* perfectly
-correct — sensible numbers, confident phrasing — and are only catchable by
-checking against ground truth. A failure that looks like success is more
-dangerous than one that looks like a failure.
+2. **Added a helper tool (`get_hour_from_time`)** — made it *worse*. One more
+   hand-off the model couldn't perform; it started trying to cram nested calls
+   into a single argument as strings (`'$(get_hour_from_time ...)'`).
 
-### Prompting vs. capability
+3. **Explicit step-by-step prompt** — improved tool *selection* but still failed
+   the hand-off (~1 in 9 success).
 
-Improving the prompt ("fetch the current hour *from* the current time") raised
-the success rate noticeably — the model attempted the right plan more often. But
-in the "successful" runs, the tool call still errored and the model **recovered
-by doing the arithmetic in its own head**, not by making the chain work. So:
+4. **A prompt that explicitly (a) numbered the steps, (b) said "pass the exact
+   value the previous tool returned," (c) said "never put a tool name as an
+   argument," and (d) said "one tool call per turn"** — the model finally passed
+   real values forward. Chaining worked. The only remaining error was a trivial
+   argument-*naming* mismatch (model sent `t=` / `time=` instead of `time_str=`).
 
-- **Prompting** can coax the model toward the right behavior and right answer
-  (on easy enough numbers) — but it papers over the capability gap rather than
-  closing it. If the math were too big to do mentally, the wins would vanish.
-- **A better model** is what actually fixes the *mechanism* (reliably parsing a
-  value out of one tool's output and passing it to the next).
+5. **Made the tool tolerant of argument names (`**kwargs`)** — the full
+   three-step chain then completed reliably (~7 of 9 runs):
+   `get_current_time → 11:33:05 → get_hour_from_time → 11 → add(15, 11) → 26`.
+
+### The conclusion (and a correction)
+
+It is tempting to conclude "small models can't do dependent chaining." That
+conclusion would be **wrong**. The chaining was never a hard capability ceiling —
+it was a **promptability + tool-design** problem. With a sufficiently explicit
+prompt and tools tolerant of imprecise arguments, `llama3.2` chained reliably.
+
+> The biggest lesson: **"the model can't do X" and "I haven't yet found the
+> prompt + tool design that lets it do X" look identical from the outside.** The
+> only way to tell them apart is to keep testing past the point where you've
+> concluded it's impossible. Roughly 40 failed runs preceded the working one.
+
+### Other failure modes seen along the way
+
+- **Confident, clean-looking wrong answers.** Several runs fetched correct data
+  then fabricated a different value in the final answer (fetched `2026-06-13`,
+  reported `2023-12-01`; fetched the real time, reported a made-up hour). These
+  look perfectly correct and are only catchable by checking against ground truth.
+  **Always verify agent output against ground truth — plausible ≠ correct.**
+- **Describes the action instead of taking it.** Some runs ended with
+  `FINAL ANSWER: add(a=15, b=11)` — narrating the final tool call instead of
+  executing it.
+- **Fetching the right data does not guarantee the model uses it** — it can
+  ignore, override, or fabricate over a tool result.
 
 ## Defensive scaffolding (mandatory for any agent, any model)
 
-Failures hit during these experiments forced real defenses, all of which a
+Failures during these experiments forced real defenses, all of which a
 production agent keeps regardless of model quality:
 
 - **Iteration cap** — an unbounded `while True` ran away, re-calling a tool
@@ -94,10 +117,12 @@ production agent keeps regardless of model quality:
   tool) no longer kills the script; the error is fed back to the model, which can
   sometimes recover.
 - **Input coercion** — the model often sends arguments as strings (`"10"`), so
-  tools must coerce (`int(...)`) rather than assume clean types.
+  tools coerce (`int(...)`) rather than assume clean types.
+- **Tolerant argument handling (`**kwargs`)** — the model invents argument names
+  (`t`, `time`, `tt`); a tolerant tool accepts the value regardless of key.
 - **Schema/executable sync** — the tool the model is *told about* (the schema)
-  and the tool the code can *run* (the dict) must match, or you get a KeyError
-  when the model requests a phantom tool.
+  and the tool the code can *run* (the dict) must match, or a phantom-tool request
+  throws a KeyError.
 
 ## Setup & run
 
@@ -117,12 +142,12 @@ the (non-deterministic) behavior.
 - The **loop is the agent**; the model only supplies per-step decisions.
 - LLMs are **non-deterministic** — same input, different output. You don't debug
   this away; you build defenses that survive it.
-- **Fetching the right data does not guarantee the model uses it** — it can
-  ignore, override, or fabricate over a tool result.
-- **Always verify agent output against ground truth.** Plausible ≠ correct. The
-  clean-looking wrong answer is the one that ships.
-- A better model raises the reliability floor a lot, but never to 100% — so the
-  defensive scaffolding and output validation are the real, permanent job.
+- **"Can't" vs. "haven't found how yet" are indistinguishable from outside** —
+  keep testing past your first conclusion. (The chaining "ceiling" wasn't one.)
+- Reliability comes from **explicit prompting + tolerant tool design**, not just
+  from a bigger model.
+- **Always verify output against ground truth.** The clean-looking wrong answer
+  is the one that ships.
 
 ## Next step
 
